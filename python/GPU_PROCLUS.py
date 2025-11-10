@@ -9,7 +9,7 @@ cuda_lib_dir = str(Path(os.environ["CONDA_PREFIX"]) / "Library" / "lib")
 import numpy as np
 import torch
 import time
-import os
+from pathlib import Path  
 
 from data.generator import *
 
