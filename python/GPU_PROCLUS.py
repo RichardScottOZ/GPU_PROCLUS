@@ -4,6 +4,8 @@ from torch.utils.cpp_extension import load
 import os
 os.environ["TORCH_NVCC_FLAGS"] = "-std=c++17"
 
+cuda_lib_dir = str(Path(os.environ["CONDA_PREFIX"]) / "Library" / "lib")
+
 import numpy as np
 import torch
 import time
