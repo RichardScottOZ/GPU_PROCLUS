@@ -174,7 +174,11 @@ impl = load(name="GPU_PROCLUS17",
                 "src/utils/mem_util.cpp",
                 "src/utils/gpu_util.cu"
             #], extra_cuda_cflags=["-w", "--std=c++14", "-arch=compute_75"], extra_cflags=["-w", "--std=c++17", "-fopenmp"], with_cuda=True)
-            ], extra_cuda_cflags=["-w", "-std=c++17", "-arch=compute_75"], extra_cflags=["/std:c++17","/openmp"], with_cuda=True)
+            ], extra_cuda_cflags=["-w", "-std=c++17", "-arch=compute_75"], extra_cflags=["/std:c++17","/openmp"], with_cuda=True,
+            
+            # NEW: point the linker to the right folder and link cudart
+            extra_ldflags=[f"/LIBPATH:{cuda_lib_dir}", "cudart.lib"],
+)
 
 print("Finished compilation, took: %.4fs" % (time.time() - t0))
 
