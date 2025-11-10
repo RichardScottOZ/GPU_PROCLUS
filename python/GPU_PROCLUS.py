@@ -1,6 +1,5 @@
 from torch.utils.cpp_extension import load
 
-
 #Make sure nvcc uses C++17 (this gets appended LAST by PyTorch)
 os.environ["TORCH_NVCC_FLAGS"] = "-std=c++17"
 
@@ -10,6 +9,47 @@ import time
 import os
 
 from data.generator import *
+
+from pathlib import Path
+THIS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = THIS_DIR.parent  # adjust if needed
+
+sources = [
+    str((REPO_ROOT / "src" / "map" / "GPU_PROCLUS_map.cpp")),
+    str((REPO_ROOT / "src" / "utils" / "mem_util.cpp")),
+    str((REPO_ROOT / "src" / "utils" / "util.cpp")),
+    str((REPO_ROOT / "src" / "algorithms" / "PROCLUS.cpp")),
+    str((REPO_ROOT / "src" / "utils" / "gpu_util.cu")),
+    str((REPO_ROOT / "src" / "algorithms" / "GPU_PROCLUS.cu")),
+]
+
+import platform
+win = platform.system() == "Windows"
+
+extra_cflags = []
+extra_cuda_cflags = []
+
+if win:
+    # MSVC equivalents
+    extra_cflags += ["/std:c++17"]
+    # Only add OpenMP if you actually use it in your C++ code
+    # extra_cflags += ["/openmp"]  # (optional)
+    # nvcc wants GCC style:
+    extra_cuda_cflags += ["-std=c++17"]
+else:
+    extra_cflags += ["-std=c++17", "-fopenmp"]  # if you use OpenMP
+    extra_cuda_cflags += ["-std=c++17"]
+
+impl = load(
+    name="GPU_PROCLUS17",
+    sources=sources,
+    with_cuda=True,
+    verbose=True,
+    extra_cflags=extra_cflags,
+    extra_cuda_cflags=extra_cuda_cflags,
+    # If you prefer to avoid ninja:
+    # use_ninja=False,
+)
 
 
 def normalize(x):
