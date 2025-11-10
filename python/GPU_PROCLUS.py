@@ -3,13 +3,14 @@ from torch.utils.cpp_extension import load
 #Make sure nvcc uses C++17 (this gets appended LAST by PyTorch)
 import os
 os.environ["TORCH_NVCC_FLAGS"] = "-std=c++17"
+from pathlib import Path  
 
 cuda_lib_dir = str(Path(os.environ["CONDA_PREFIX"]) / "Library" / "lib")
 
 import numpy as np
 import torch
 import time
-from pathlib import Path  
+
 
 from data.generator import *
 
