@@ -1,6 +1,7 @@
 from torch.utils.cpp_extension import load
 
 #Make sure nvcc uses C++17 (this gets appended LAST by PyTorch)
+import os
 os.environ["TORCH_NVCC_FLAGS"] = "-std=c++17"
 
 import numpy as np
