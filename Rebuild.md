@@ -17,6 +17,9 @@ conda --version
 ## nvcc
 - e.g. conda install -c nvidia cuda-toolkit=12.4
 
+## package
+- torch, ninja, rasterio
+
 :: Ensure linker can find the Conda CUDA libs in this shell
 set "LIB=%CONDA_PREFIX%\Library\lib;%LIB%"
 
