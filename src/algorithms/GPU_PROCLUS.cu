@@ -7,6 +7,28 @@
 #include "../utils/cuda_util.cuh"
 #include "GPU_PROCLUS.cuh"
 
+// --- BEGIN FIX: helpers ---
+#ifndef MAX_THREADS_PER_BLOCK
+#define MAX_THREADS_PER_BLOCK 1024
+#endif
+
+// Generic helper to launch a 1-D kernel over k items safely (replaces <<<1,k>>>)
+inline void make_k_launch(dim3& grid, dim3& block, int k, int T = 256) {
+    if (T > MAX_THREADS_PER_BLOCK) T = MAX_THREADS_PER_BLOCK;
+    if (T < 1) T = 1;
+    block = dim3(T, 1, 1);
+    grid  = dim3((k + T - 1) / T, 1, 1);
+}
+
+// Helper for one-block launches up to device limit (e.g., for reductions expecting a single block)
+inline void make_k_launch_one_block(dim3& grid, dim3& block, int k) {
+    int T = k < MAX_THREADS_PER_BLOCK ? k : MAX_THREADS_PER_BLOCK;
+    if (T < 1) T = 1;
+    block = dim3(T, 1, 1);
+    grid  = dim3(1, 1, 1);
+}
+// --- END FIX: helpers ---
+
 
 #define BLOCK_SIZE 1024
 #define BLOCK_SIZE_SMALL 128
@@ -172,8 +194,9 @@ void gpu_compute_L_kernel_sum_dist_V2(float *d_dist_n_k, int *d_M_current, float
     }
 }
 
+/*
 __global__
-void gpu_compute_L_kernel_compute_delta_V2(float *d_delta, float *d_dist_n_k, int *d_M_current, int n, int k) {
+void old_gpu_compute_L_kernel_compute_delta_V2(float *d_delta, float *d_dist_n_k, int *d_M_current, int n, int k) {
     for (int i = threadIdx.x; i < k; i += blockDim.x) {//independent
         d_delta[i] = 1000000.;//todo not nice
         for (int j = 0; j < k; j++) {
@@ -186,6 +209,21 @@ void gpu_compute_L_kernel_compute_delta_V2(float *d_delta, float *d_dist_n_k, in
         }
     }
 }
+*/
+__global__
+void gpu_compute_L_kernel_compute_delta_V2(float *d_delta, float *d_dist_n_k, int *d_M_current, int n, int k) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= k) return;
+    d_delta[i] = 1000000.f; // not nice, but consistent with original
+    for (int j = 0; j < k; ++j) {
+        int p = d_M_current[j];
+        if (i != j) {
+            float val = d_dist_n_k[i * n + p];
+            if (val <= d_delta[i]) d_delta[i] = val;
+        }
+    }
+}
+
+
 
 __global__
 void gpu_compute_L_kernel_compute_L_V2(int *d_L, int *d_L_sizes, float *d_delta, float *d_dist_n_k, int n, int k) {
@@ -215,7 +253,11 @@ void gpu_compute_L(int *d_L, int *d_L_sizes,
             n, d, k);
 
     //compute delta
-    gpu_compute_L_kernel_compute_delta_V2 << < 1, k >> > (d_delta, d_dist_n_k, d_M_current, n, k);
+    //old gpu_compute_L_kernel_compute_delta_V2 << < 1, k >> > (d_delta, d_dist_n_k, d_M_current, n, k);
+    {
+        dim3 grid, block; make_k_launch(grid, block, k, 256);
+        gpu_compute_L_kernel_compute_delta_V2<<<grid, block>>>(d_delta, d_dist_n_k, d_M_current, n, k);
+    }    
 
     //compute L
     cudaMemset(d_L_sizes, 0, k * sizeof(int));
@@ -488,7 +530,7 @@ gpu_restructure_D(int *__restrict__ d_Ds, int *__restrict__ d_D_sizes, const boo
 //}
 __global__
 void
-gpu_assign_points_kernel(int *__restrict__ d_Ds, int *__restrict__ d_D_sizes,
+old_gpu_assign_points_kernel(int *__restrict__ d_Ds, int *__restrict__ d_D_sizes,
                          int *__restrict__ d_C, int *__restrict__ d_C_size,
                          const float *__restrict__ d_data, const int *__restrict__ d_M_current,
                          const int n, const int k, const int d) {
@@ -579,7 +621,55 @@ gpu_assign_points_kernel_CG(int *__restrict__ d_Ds, int *__restrict__ d_D_sizes,
 }
 */
 
-void gpu_assign_points(int *d_C, int *d_C_sizes,
+// --- BEGIN FIX: k-tiled assignment kernel ---
+__global__
+void gpu_assign_points_kernel(int * __restrict__ d_Ds,
+                              int * __restrict__ d_D_sizes,
+                              int * __restrict__ d_C,
+                              int * __restrict__ d_C_size,
+                              const float * __restrict__ d_data,
+                              const int   * __restrict__ d_M_current,
+                              const int n, const int k, const int d)
+{
+    extern __shared__ float s_min_value[];   // length = blockDim.x
+    const int p  = blockIdx.x * blockDim.x + threadIdx.x;  // point index
+
+    // init per-point shared min once per tile
+    if (p < n) s_min_value[threadIdx.x] = 1.0e30f;
+    __syncthreads();
+
+    // Tile over clusters in strides of blockDim.y (removes dependency on k)
+    for (int i = threadIdx.y; i < k; i += blockDim.y) {
+        float dist = 0.0f;
+        if (p < n) {
+            const int m_i  = d_M_current[i];
+            const int sz   = d_D_sizes[i];
+            // L1 distance over selected dims for cluster i
+            for (int l = 0; l < sz; ++l) {
+                const int j = d_Ds[i * d + l];
+                dist += fabsf(d_data[p * d + j] - d_data[m_i * d + j]);
+            }
+            if (sz > 0) dist /= sz;
+            // track per-point minimum across this tile of clusters
+            atomicMin(&s_min_value[threadIdx.x], dist);
+        }
+
+        __syncthreads(); // ensure all updates to s_min_value are visible
+
+        // winner writes membership for cluster i (same tie behaviour as original)
+        if (p < n && dist == s_min_value[threadIdx.x]) {
+            const unsigned int idx = atomicInc((unsigned int*)&d_C_size[i], n);
+            d_C[i * n + idx] = p;
+        }
+
+        __syncthreads(); // reset for next cluster tile
+        if (p < n) s_min_value[threadIdx.x] = 1.0e30f;
+        __syncthreads();
+    }
+}
+// --- END FIX ---
+
+void old_gpu_assign_points(int *d_C, int *d_C_sizes,
                        bool *d_D, int *d_Ds, int *d_D_sizes,
                        int *d_M_current,
                        float *d_data,
@@ -617,6 +707,38 @@ void gpu_assign_points(int *d_C, int *d_C_sizes,
 //    gpu_assign_points_kernel<<<number_of_blocks, BLOCK_SIZE>>>(d_Ds, d_D_sizes, d_C, d_C_sizes, d_data, d_M_current, n,
 //                                                               k, d);
 }
+
+// --- BEGIN FIX: k-agnostic host launcher for assignment ---
+void gpu_assign_points(int *d_C, int *d_C_sizes,
+                       bool *d_D, int *d_Ds, int *d_D_sizes,
+                       int *d_M_current,
+                       float *d_data,
+                       int n, int d, int k)
+{
+    // Safe resets (fix wrong sizeof)
+    cudaMemset(d_C_sizes, 0, k * sizeof(int));
+    cudaMemset(d_Ds,      0, (size_t)k * d * sizeof(int));
+    cudaMemset(d_D_sizes, 0, k * sizeof(int));
+    gpuErrchk(cudaPeekAtLastError());
+
+    // Build the list of projected dims per cluster (unchanged)
+    gpu_restructure_D<<<k, d>>>(d_Ds, d_D_sizes, d_D, d, k);
+    gpuErrchk(cudaPeekAtLastError());
+
+    // Fixed block; kernel will tile over clusters in threadIdx.y
+    const int tx = 32;          // threads over points
+    const int ty = 32;          // tile height over clusters
+    static_assert(32*32 <= MAX_THREADS_PER_BLOCK, "block too large");
+    dim3 block(tx, ty);
+    int  nblocks = (n + tx - 1) / tx;
+    size_t shmem = (size_t)tx * sizeof(float); // one float per point-thread
+
+    gpu_assign_points_kernel<<<nblocks, block, shmem>>>(
+        d_Ds, d_D_sizes, d_C, d_C_sizes, d_data, d_M_current, n, k, d
+    );
+    gpuErrchk(cudaPeekAtLastError());
+}
+// --- END FIX ---
 
 
 //todo we should reconsider how we represent clustering - should we represent it in to different way? or just change it at the very end?
@@ -661,20 +783,42 @@ void gpu_evaluate_cluster_kernel(float *d_cost, int *d_C,
     }
 }
 
+/*
 void
 gpu_evaluate_cluster(float *d_cost, int *d_C, int *d_C_sizes, bool *d_D, int *d_D_sizes, float *d_data,
                      int n, int d, int k) {
 
     int number_of_blocks = n / BLOCK_SIZE;
     if (n % BLOCK_SIZE) number_of_blocks++;
-    dim3 grid(d, k);
-    dim3 block(min(BLOCK_SIZE, (int) n / k));
+    // olddim3 grid(d, k);
+    // old dim3 block(min(BLOCK_SIZE, (int) n / k));
+
+    // --- BEGIN FIX: avoid blockDim.x == 0 when k≈n ---
+    int tx_eval = (n / max(1, k));
+    if (tx_eval < 1) tx_eval = 1;
+    if (tx_eval > BLOCK_SIZE) tx_eval = BLOCK_SIZE;
+    dim3 grid_eval(d, k), block_eval(tx_eval);
+
+    cudaMemset(d_cost, 0, sizeof(float));
+    gpu_evaluate_cluster_kernel<<<grid_eval, block_eval>>>(d_cost, d_C, d_C_sizes, d_D, d_D_sizes, d_data, n, d, k);
+    // --- END FIX ---    
 
     gpuErrchk(cudaPeekAtLastError());
+}
+*/
+
+
+void gpu_evaluate_cluster(float *d_cost, int *d_C, int *d_C_sizes, bool *d_D, int *d_D_sizes, float *d_data,
+                          int n, int d, int k)
+{
+    // grid over (d, k); threads over points in each (i,j)
+    int tx_eval = (n / max(1, k));
+    if (tx_eval < 1) tx_eval = 1;
+    if (tx_eval > BLOCK_SIZE) tx_eval = BLOCK_SIZE;
+    dim3 grid_eval(d, k), block_eval(tx_eval);
+
     cudaMemset(d_cost, 0, sizeof(float));
-    gpuErrchk(cudaPeekAtLastError());
-    gpu_evaluate_cluster_kernel << < grid, block >> > (d_cost, d_C, d_C_sizes, d_D, d_D_sizes, d_data,
-            n, d, k);
+    gpu_evaluate_cluster_kernel<<<grid_eval, block_eval>>>(d_cost, d_C, d_C_sizes, d_D, d_D_sizes, d_data, n, d, k);
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -688,9 +832,9 @@ gpu_update_best_kernel_is_best(float *d_objective_function, float *d_best_object
     }
 }
 
+/*
 __global__
-void
-gpu_update_best_kernel_init_k(int *d_termination_criterion, int *d_M_best, int *d_M_current,
+void old_gpu_update_best_kernel_init_k(int *d_termination_criterion, int *d_M_best, int *d_M_current,
                               bool *d_bad, int k) {
 
     if (d_termination_criterion[0] == 0) {//todo worng!!!! then we allways pick the last????
@@ -700,6 +844,18 @@ gpu_update_best_kernel_init_k(int *d_termination_criterion, int *d_M_best, int *
         }
     }
 }
+*/
+
+__global__
+void gpu_update_best_kernel_init_k(int *d_termination_criterion, int *d_M_best, int *d_M_current,
+                                   bool *d_bad, int k) {
+    int i = threadIdx.x; if (i >= k) return;   // single-block launch
+    if (d_termination_criterion[0] == 0) {
+        d_M_best[i] = d_M_current[i];
+        d_bad[i]    = false;
+    }
+}
+
 
 __global__
 void
@@ -720,8 +876,9 @@ gpu_update_best_kernel_C(int *d_C_best, int *d_C_sizes_best, int *d_C, int *d_C_
     }
 }
 
+/*
 __global__
-void gpu_update_best_kernel_find_bad(int *d_C_sizes_best, int *d_termination_criterion, bool *d_bad, int k, int n,
+void old_gpu_update_best_kernel_find_bad(int *d_C_sizes_best, int *d_termination_criterion, bool *d_bad, int k, int n,
                                      float min_deviation) {
 
     __shared__ int min_value;
@@ -749,6 +906,25 @@ void gpu_update_best_kernel_find_bad(int *d_C_sizes_best, int *d_termination_cri
         }
     }
 }
+*/
+
+__global__
+void gpu_update_best_kernel_find_bad(int *d_C_sizes_best, int *d_termination_criterion, bool *d_bad, int k, int n,
+                                     float min_deviation) {
+    extern __shared__ int s[]; // optional if you want; current code uses a single shared int
+    __shared__ int min_value;
+    if (threadIdx.x == 0) min_value = 1000000;
+    __syncthreads();
+
+    if (d_termination_criterion[0] == 0) {
+        for (int i = threadIdx.x; i < k; i += blockDim.x) atomicMin(&min_value, d_C_sizes_best[i]);
+        __syncthreads();
+        for (int i = threadIdx.x; i < k; i += blockDim.x) if (d_C_sizes_best[i] == min_value) d_bad[i] = true;
+        __syncthreads();
+        for (int i = threadIdx.x; i < k; i += blockDim.x) if (d_C_sizes_best[i] < (n / k) * min_deviation) d_bad[i] = true;
+    }
+}
+
 
 void
 gpu_update_best(float *d_cost, float *d_cost_best,
@@ -759,11 +935,18 @@ gpu_update_best(float *d_cost, float *d_cost_best,
                 float min_deviation, int n, int k) {
 
     gpu_update_best_kernel_is_best << < 1, 1 >> > (d_cost, d_cost_best, d_termination_criterion);
-    gpu_update_best_kernel_init_k << < 1, k >> > (d_termination_criterion, d_M_best, d_M_current, d_bad, k);
-    gpu_update_best_kernel_C << < k, BLOCK_SIZE >> >
-    (d_C_best, d_C_sizes_best, d_C, d_C_sizes, d_termination_criterion, n);
-    gpu_update_best_kernel_find_bad << < 1, k >> >
-    (d_C_sizes_best, d_termination_criterion, d_bad, k, n, min_deviation);
+    //old gpu_update_best_kernel_init_k << < 1, k >> > (d_termination_criterion, d_M_best, d_M_current, d_bad, k);
+    { dim3 grid, block; make_k_launch_one_block(grid, block, k);
+        gpu_update_best_kernel_init_k<<<grid, block>>>(d_termination_criterion, d_M_best, d_M_current, d_bad, k);
+    }
+
+
+    gpu_update_best_kernel_C << < k, BLOCK_SIZE >> >    (d_C_best, d_C_sizes_best, d_C, d_C_sizes, d_termination_criterion, n);
+    //old gpu_update_best_kernel_find_bad << < 1, k >> >    (d_C_sizes_best, d_termination_criterion, d_bad, k, n, min_deviation);
+    { dim3 grid, block; make_k_launch_one_block(grid, block, k);
+    gpu_update_best_kernel_find_bad<<<grid, block>>>(d_C_sizes_best, d_termination_criterion, d_bad, k, n, min_deviation);
+    }
+
 
 }
 
@@ -863,7 +1046,10 @@ void remove_outliers(int *d_C_result, int *d_C_best, int *d_C_sizes_best,
                      float *d_data,
                      int n, int d, int k) {
 
-    set_all << < 1, k >> > (d_delta, 1000000., k);//todo not nice
+    //old set_all << < 1, k >> > (d_delta, 1000000., k);//todo not nice
+    { dim3 grid, block; make_k_launch(grid, block, k, 256);
+        set_all<<<grid, block>>>(d_delta, 1000000., k);
+    }    
 
     remove_outliers_kernel_min_delta << < k, min(k, BLOCK_SIZE) >> > (d_delta,
             d_D,
@@ -1236,7 +1422,11 @@ void gpu_compute_L_keep(int *d_L, int *d_L_sizes_change, int *d_L_sizes, int *d_
             n, d);
 
     //compute delta
-    gpu_compute_L_kernel_compute_delta_V2 << < 1, k >> > (d_delta, d_dist_n_k, d_M_current, n, k);
+    //old gpu_compute_L_kernel_compute_delta_V2 << < 1, k >> > (d_delta, d_dist_n_k, d_M_current, n, k);
+    {
+        dim3 grid, block; make_k_launch(grid, block, k, 256);
+        gpu_compute_L_kernel_compute_delta_V2<<<grid, block>>>(d_delta, d_dist_n_k, d_M_current, n, k);
+    }    
 
     //compute L
     cudaMemset(d_L_sizes_change, 0, k * sizeof(int));
@@ -1673,12 +1863,20 @@ gpu_compute_L_kernel_sum_dist_SAVE(const int *__restrict__ d_M_idx, const int *_
     }
 }
 
+/*
 __global__
-void gpu_compute_L_kernel_sqrt_dist_pre_mark(int *d_M_idx, float *d_dist_n_Bk, bool *d_dist_n_Bk_set, int k, int n) {
+void old_gpu_compute_L_kernel_sqrt_dist_pre_mark(int *d_M_idx, float *d_dist_n_Bk, bool *d_dist_n_Bk_set, int k, int n) {
     for (int l = threadIdx.x; l < k; l += blockDim.x) {//independent
         int i = d_M_idx[l];
         d_dist_n_Bk_set[i] = true;
     }
+}
+*/
+__global__
+void gpu_compute_L_kernel_sqrt_dist_pre_mark(int *d_M_idx, float *d_dist_n_Bk, bool *d_dist_n_Bk_set, int k, int n) {
+    int l = blockIdx.x * blockDim.x + threadIdx.x; if (l >= k) return;
+    int i = d_M_idx[l];
+    d_dist_n_Bk_set[i] = true;
 }
 
 __global__
@@ -1731,12 +1929,21 @@ gpu_compute_L_kernel_compute_L_pre(int *d_posneg, int *d_M_idx, int *d_L, int *d
     }
 }
 
+/*
 __global__
-void gpu_compute_L_kernel_set_old_delta_pre(int *d_M_idx, float *d_old_delta, float *d_delta, int k) {
+void old_gpu_compute_L_kernel_set_old_delta_pre(int *d_M_idx, float *d_old_delta, float *d_delta, int k) {
     for (int i = threadIdx.x; i < k; i += blockDim.x) {
         d_old_delta[d_M_idx[i]] = d_delta[i];
     }
 }
+*/
+
+__global__
+void gpu_compute_L_kernel_set_old_delta_pre(int *d_M_idx, float *d_old_delta, float *d_delta, int k) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= k) return;
+    d_old_delta[d_M_idx[i]] = d_delta[i];
+}
+
 
 void gpu_compute_L_save(int *d_L, int *d_L_sizes_change, int *d_L_sizes, int *d_lambda,
                         float *d_dist_n_Bk, bool *d_dist_n_Bk_set,
@@ -1755,11 +1962,21 @@ void gpu_compute_L_save(int *d_L, int *d_L_sizes_change, int *d_L_sizes, int *d_
             k, d, n);
     gpuErrchk(cudaPeekAtLastError());
 
-    gpu_compute_L_kernel_sqrt_dist_pre_mark << < 1, k >> > (d_M_idx, d_dist_n_Bk, d_dist_n_Bk_set, k, n);
+    //compute mark
+    //old gpu_compute_L_kernel_sqrt_dist_pre_mark << < 1, k >> > (d_M_idx, d_dist_n_Bk, d_dist_n_Bk_set, k, n);
+    { dim3 grid, block; make_k_launch(grid, block, k, 256);
+    gpu_compute_L_kernel_sqrt_dist_pre_mark<<<grid, block>>>(d_M_idx, d_dist_n_Bk, d_dist_n_Bk_set, k, n);
+    }
+
     gpuErrchk(cudaPeekAtLastError());
 
     //compute delta
-    gpu_compute_L_kernel_compute_delta_pre << < k, k >> > (d_M_idx, d_M, d_delta, d_dist_n_Bk, k, n);
+    //old gpu_compute_L_kernel_compute_delta_pre << < k, k >> > (d_M_idx, d_M, d_delta, d_dist_n_Bk, k, n);
+
+    { dim3 grid, block; make_k_launch(grid, block, k, 256);
+    gpu_compute_L_kernel_compute_delta_pre<<<grid, block>>>(d_M_idx, d_M, d_delta, d_dist_n_Bk, k, n);
+    }
+
     gpuErrchk(cudaPeekAtLastError());
 
     //compute L
@@ -1770,7 +1987,12 @@ void gpu_compute_L_save(int *d_L, int *d_L_sizes_change, int *d_L_sizes, int *d_
             d_dist_n_Bk, d_delta, d_delta_old, k, n);
     gpuErrchk(cudaPeekAtLastError());
 
-    gpu_compute_L_kernel_set_old_delta_pre << < 1, k >> > (d_M_idx, d_delta_old, d_delta, k);
+    //old gpu_compute_L_kernel_set_old_delta_pre << < 1, k >> > (d_M_idx, d_delta_old, d_delta, k);
+    { dim3 grid, block; make_k_launch(grid, block, k, 256);
+    gpu_compute_L_kernel_set_old_delta_pre<<<grid, block>>>(d_M_idx, d_delta_old, d_delta, k);
+    }
+
+
     gpuErrchk(cudaPeekAtLastError());
 }
 
@@ -1871,9 +2093,9 @@ void gpu_find_dimensions_save(bool *d_D, float *d_Z, float *d_X, float *d_H,
 
 }
 
+/*
 __global__
-void
-gpu_update_best_kernel_init_k_pre(int *d_M_idx, int *d_M_idx_best, int *d_termination_criterion,
+void old_gpu_update_best_kernel_init_k_pre(int *d_M_idx, int *d_M_idx_best, int *d_termination_criterion,
                                   int *d_M_best, int *d_M_current,
                                   bool *d_bad, int k) {
 
@@ -1883,6 +2105,19 @@ gpu_update_best_kernel_init_k_pre(int *d_M_idx, int *d_M_idx_best, int *d_termin
             d_M_idx_best[i] = d_M_idx[i];
             d_bad[i] = false;
         }
+    }
+}
+*/
+
+__global__
+void gpu_update_best_kernel_init_k_pre(int *d_M_idx, int *d_M_idx_best, int *d_termination_criterion,
+                                       int *d_M_best, int *d_M_current,
+                                       bool *d_bad, int k) {
+    int i = threadIdx.x; if (i >= k) return;   // single-block launch
+    if (d_termination_criterion[0] == 0) {
+        d_M_best[i]     = d_M_current[i];
+        d_M_idx_best[i] = d_M_idx[i];
+        d_bad[i]        = false;
     }
 }
 
@@ -1896,12 +2131,22 @@ gpu_update_best_SAVE(int *d_M_idx, int *d_M_idx_best, float *d_cost,
                      float min_deviation, int n, int k) {
 
     gpu_update_best_kernel_is_best << < 1, 1 >> > (d_cost, d_cost_best, d_termination_criterion);
-    gpu_update_best_kernel_init_k_pre << < 1, k >> > (d_M_idx, d_M_idx_best, d_termination_criterion, d_M_best,
-            d_M_current, d_bad, k);
+    //old gpu_update_best_kernel_init_k_pre << < 1, k >> > (d_M_idx, d_M_idx_best, d_termination_criterion, d_M_best,
+    //old         d_M_current, d_bad, k);
+
+    { dim3 grid, block; make_k_launch_one_block(grid, block, k);
+    gpu_update_best_kernel_init_k_pre<<<grid, block>>>(d_M_idx, d_M_idx_best, d_termination_criterion, d_M_best,
+                                                        d_M_current, d_bad, k);
+    }
+
     gpu_update_best_kernel_C << < k, BLOCK_SIZE >> >
     (d_C_best, d_C_sizes_best, d_C, d_C_sizes, d_termination_criterion, n);
-    gpu_update_best_kernel_find_bad << < 1, k >> >
-    (d_C_sizes_best, d_termination_criterion, d_bad, k, n, min_deviation);
+    //oldgpu_update_best_kernel_find_bad << < 1, k >> >    (d_C_sizes_best, d_termination_criterion, d_bad, k, n, min_deviation);
+
+    { dim3 grid, block; make_k_launch_one_block(grid, block, k);
+    gpu_update_best_kernel_find_bad<<<grid, block>>>(d_C_sizes_best, d_termination_criterion, d_bad, k, n, min_deviation);
+    }
+    
 
 }
 
